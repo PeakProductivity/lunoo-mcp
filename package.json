@@ -1,0 +1,26 @@
+{
+  "name": "lunoo-mcp-server",
+  "version": "1.0.0",
+  "description": "Production-ready MCP server for Lunoo rankings platform",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {},
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "lunoo",
+    "rankings"
+  ],
+  "author": "Lunoo",
+  "license": "MIT"
+}
