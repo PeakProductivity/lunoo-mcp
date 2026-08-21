@@ -16,6 +16,18 @@ This is a read-only public proxy over Lunoo's public web API. No authentication 
 - **Privacy**: No raw prompts, tool arguments, or tool results are stored. See https://lunoo.com/privacy
 - **Safety**: All three tools are read-only and expose MCP read-only annotations
 
+## Security and abuse controls
+
+- The server listens on `127.0.0.1` by default so a reverse proxy can expose only the intended HTTPS route.
+- Each client is limited to 120 MCP requests per minute.
+- No more than 20 MCP requests and 12 upstream Lunoo requests run at once.
+- JSON bodies are limited to 32 KB, JSON-RPC batches to 20 messages, and tool inputs to documented lengths.
+- The in-memory cache is limited to 256 entries and evicts old keys.
+- User input is encoded into fixed Lunoo paths. It cannot select an arbitrary upstream host.
+- The server does not execute commands, evaluate user code, read local files, or expose environment variables.
+
+Self-hosted deployments should keep the Node port private and expose `/mcp` through an HTTPS reverse proxy. Do not publish port 8972 directly.
+
 ## Quick Start
 
 ### Claude custom connector

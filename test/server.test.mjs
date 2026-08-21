@@ -3,6 +3,8 @@ import { createServer } from 'node:http';
 import { after, before, test } from 'node:test';
 
 const upstreamRequests = [];
+let activeSlowRequests = 0;
+let maxActiveSlowRequests = 0;
 const upstreamServer = createServer((request, response) => {
   const requestUrl = new URL(request.url, `http://${request.headers.host}`);
   upstreamRequests.push({
@@ -90,6 +92,21 @@ const upstreamServer = createServer((request, response) => {
         },
       ],
     }));
+    return;
+  }
+
+  if (requestUrl.pathname === '/best/slow.json') {
+    activeSlowRequests += 1;
+    maxActiveSlowRequests = Math.max(maxActiveSlowRequests, activeSlowRequests);
+    setTimeout(() => {
+      activeSlowRequests -= 1;
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        name: 'Slow test ranking',
+        item_count: 3,
+        top_items: [{ name: 'Slow pick', slug: 'slow-pick', score: 8 }],
+      }));
+    }, 200);
     return;
   }
 
@@ -324,7 +341,14 @@ test('find_niche keeps the product noun ahead of an audience or use-case term', 
 test('find_niche rejects empty, gibberish, and unsupported input', async () => {
   serverModule.clearCache();
 
-  for (const query of ['', 'xyzzy qqqq', '!@#$']) {
+  const empty = await callRpc('tools/call', {
+    name: 'find_niche',
+    arguments: { query: '' },
+  }, 8);
+  assert.equal(empty.result.isError, true);
+  assert.match(empty.result.content[0].text, /non-empty string/);
+
+  for (const query of ['xyzzy qqqq', '!@#$']) {
     const response = await callRpc('tools/call', {
       name: 'find_niche',
       arguments: { query },
@@ -459,4 +483,83 @@ test('initialize usage keeps bounded client metadata without request details', (
 test('PM2 wrapper launches the HTTP server even when argv points at its process container', () => {
   assert.equal(serverModule.shouldStartServer('/usr/lib/node_modules/pm2/ProcessContainerFork.js', '3'), true);
   assert.equal(serverModule.shouldStartServer('/usr/lib/node_modules/pm2/ProcessContainerFork.js', undefined), false);
+});
+
+test('server defaults to loopback and publishes bounded input schemas', async () => {
+  assert.equal(serverModule.HOST, '127.0.0.1');
+  const response = await callRpc('tools/list', {}, 90);
+  const byName = new Map(response.result.tools.map((tool) => [tool.name, tool]));
+
+  assert.equal(byName.get('find_niche').inputSchema.properties.query.maxLength, 240);
+  assert.equal(byName.get('get_rankings').inputSchema.properties.niche.maxLength, 240);
+  assert.equal(byName.get('get_rankings').inputSchema.properties.limit.maximum, 50);
+  assert.equal(byName.get('get_item').inputSchema.properties.slug.maxLength, 160);
+});
+
+test('oversized tool inputs are rejected before any upstream request', async () => {
+  const beforeCount = upstreamRequests.length;
+  const response = await callRpc('tools/call', {
+    name: 'find_niche',
+    arguments: { query: 'x'.repeat(241) },
+  }, 91);
+
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /at most 240 characters/);
+  assert.equal(upstreamRequests.length, beforeCount);
+});
+
+test('JSON request bodies and JSON-RPC batches have hard limits', async () => {
+  const oversizedBody = await fetch(`${mcpBaseUrl}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ padding: 'x'.repeat(33 * 1024) }),
+  });
+  assert.equal(oversizedBody.status, 413);
+
+  const batch = Array.from({ length: 21 }, (_, index) => ({
+    jsonrpc: '2.0', method: 'ping', params: {}, id: index + 1,
+  }));
+  const oversizedBatch = await fetch(`${mcpBaseUrl}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(batch),
+  });
+  assert.equal(oversizedBatch.status, 413);
+});
+
+test('global MCP concurrency is bounded', async () => {
+  serverModule.clearCache();
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'tools/call',
+    params: { name: 'get_rankings', arguments: { niche: 'slow', limit: 1 } },
+    id: 92,
+  });
+  const responses = await Promise.all(Array.from({ length: 21 }, () => fetch(`${mcpBaseUrl}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  })));
+  const statuses = responses.map((response) => response.status);
+
+  assert.equal(statuses.filter((status) => status === 503).length, 1);
+  assert.equal(statuses.filter((status) => status === 200).length, 20);
+  assert.equal(maxActiveSlowRequests <= 12, true);
+});
+
+test('rate limiter rejects a client after the bounded request window', () => {
+  const request = { socket: { remoteAddress: '198.51.100.10' }, headers: {} };
+  for (let index = 0; index < 120; index += 1) {
+    assert.equal(serverModule.allowClientRequest(request, 1000), true);
+  }
+  assert.equal(serverModule.allowClientRequest(request, 1000), false);
+  assert.equal(serverModule.allowClientRequest(request, 61001), true);
+});
+
+test('cache evicts old user-controlled query keys', async () => {
+  serverModule.clearCache();
+  for (let index = 0; index < 270; index += 1) {
+    await serverModule.toolFindNiche(`nonexistentquery${index}`);
+  }
+  assert.equal(serverModule.cacheEntryCount() <= 256, true);
 });

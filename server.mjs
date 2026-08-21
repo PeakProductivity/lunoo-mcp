@@ -5,6 +5,16 @@ import { pathToFileURL } from 'node:url';
 
 const app = express();
 const PORT = process.env.PORT || 8972;
+const HOST = process.env.MCP_HOST || '127.0.0.1';
+const MAX_CACHE_ENTRIES = 256;
+const MAX_BATCH_SIZE = 20;
+const MAX_CONCURRENT_MCP_REQUESTS = 20;
+const MAX_CONCURRENT_UPSTREAM_REQUESTS = 12;
+const MAX_QUERY_LENGTH = 240;
+const MAX_SLUG_LENGTH = 160;
+const RATE_LIMIT_MAX = 120;
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const MAX_RATE_LIMIT_CLIENTS = 10000;
 const LUNOO_ORIGIN = 'https://lunoo.com';
 const UPSTREAM_BASE_URL = process.env.LUNOO_UPSTREAM_BASE_URL || LUNOO_ORIGIN;
 const MCP_USAGE_ENDPOINT = process.env.MCP_USAGE_ENDPOINT || `${LUNOO_ORIGIN}/api/mcp-usage`;
@@ -59,7 +69,83 @@ app.use((error, request, response, next) => {
 
   next(error);
 });
-app.use(express.json());
+
+const rateLimitClients = new Map();
+let activeMcpRequests = 0;
+let activeUpstreamRequests = 0;
+const upstreamWaiters = [];
+
+function acquireUpstreamSlot() {
+  if (activeUpstreamRequests < MAX_CONCURRENT_UPSTREAM_REQUESTS) {
+    activeUpstreamRequests += 1;
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => upstreamWaiters.push(resolve));
+}
+
+function releaseUpstreamSlot() {
+  const next = upstreamWaiters.shift();
+  if (next) {
+    next();
+    return;
+  }
+  activeUpstreamRequests = Math.max(0, activeUpstreamRequests - 1);
+}
+
+function clientKey(request) {
+  const remoteAddress = String(request.socket?.remoteAddress || 'unknown').slice(0, 64);
+  const isLoopback = remoteAddress === '127.0.0.1'
+    || remoteAddress === '::1'
+    || remoteAddress === '::ffff:127.0.0.1';
+  if (!isLoopback) return remoteAddress;
+
+  return String(request.headers['x-real-ip'] || remoteAddress).split(',')[0].trim().slice(0, 64);
+}
+
+function allowClientRequest(request, now = Date.now()) {
+  const key = clientKey(request);
+  let bucket = rateLimitClients.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+  }
+  bucket.count += 1;
+  rateLimitClients.delete(key);
+  rateLimitClients.set(key, bucket);
+
+  while (rateLimitClients.size > MAX_RATE_LIMIT_CLIENTS) {
+    rateLimitClients.delete(rateLimitClients.keys().next().value);
+  }
+
+  return bucket.count <= RATE_LIMIT_MAX;
+}
+
+app.use('/mcp', (request, response, next) => {
+  if (!allowClientRequest(request)) {
+    response.setHeader('retry-after', '60');
+    response.status(429).json({ error: 'Too many requests' });
+    return;
+  }
+
+  if (activeMcpRequests >= MAX_CONCURRENT_MCP_REQUESTS) {
+    response.setHeader('retry-after', '1');
+    response.status(503).json({ error: 'MCP server is busy' });
+    return;
+  }
+
+  activeMcpRequests += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeMcpRequests = Math.max(0, activeMcpRequests - 1);
+  };
+  response.once('finish', release);
+  response.once('close', release);
+  next();
+});
+
+app.use(express.json({ limit: '32kb', strict: true }));
 
 // ============================================================
 // Cache layer with TTL
@@ -69,6 +155,8 @@ const cache = new Map();
 function getCached(key, ttlMs) {
   const entry = cache.get(key);
   if (entry && Date.now() < entry.expiresAt) {
+    cache.delete(key);
+    cache.set(key, entry);
     return entry.value;
   }
   if (entry) {
@@ -78,14 +166,23 @@ function getCached(key, ttlMs) {
 }
 
 function setCached(key, value, ttlMs) {
+  cache.delete(key);
   cache.set(key, {
     value,
     expiresAt: Date.now() + ttlMs,
   });
+
+  while (cache.size > MAX_CACHE_ENTRIES) {
+    cache.delete(cache.keys().next().value);
+  }
 }
 
 function clearCache() {
   cache.clear();
+}
+
+function cacheEntryCount() {
+  return cache.size;
 }
 
 function countToolResults(response) {
@@ -573,6 +670,7 @@ async function broadFallbackCandidates() {
 // Fetch wrapper with timeout, User-Agent, error handling
 // ============================================================
 async function fetchWithTimeout(url, timeoutMs = 10000) {
+  await acquireUpstreamSlot();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -583,8 +681,6 @@ async function fetchWithTimeout(url, timeoutMs = 10000) {
         'User-Agent': 'LunooMCP/1.0 (+https://lunoo.com)',
       },
     });
-
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
       return {
@@ -604,7 +700,6 @@ async function fetchWithTimeout(url, timeoutMs = 10000) {
 
     return { ok: true, status: 200, data };
   } catch (err) {
-    clearTimeout(timeoutId);
     if (err.name === 'AbortError') {
       return {
         ok: false,
@@ -617,6 +712,9 @@ async function fetchWithTimeout(url, timeoutMs = 10000) {
       status: 0,
       error: err.message || String(err),
     };
+  } finally {
+    clearTimeout(timeoutId);
+    releaseUpstreamSlot();
   }
 }
 
@@ -713,7 +811,15 @@ async function resolveNicheCandidates(query) {
  * resolver is. No slug is emitted unless it came from a public endpoint.
  */
 async function toolFindNiche(query) {
-  const resolution = await resolveNicheCandidates(query);
+  if (typeof query !== 'string' || !query.trim() || query.length > MAX_QUERY_LENGTH) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `query must be a non-empty string of at most ${MAX_QUERY_LENGTH} characters` }],
+    };
+  }
+
+  const boundedQuery = query.trim();
+  const resolution = await resolveNicheCandidates(boundedQuery);
   const result = resolution.candidates.map((item) => ({
     slug: item.slug,
     name: item.name || item.slug.replace(/-/g, ' '),
@@ -728,7 +834,7 @@ async function toolFindNiche(query) {
       isError: true,
       content: [{
         type: 'text',
-        text: `No confident live Lunoo ranking matches "${String(query ?? '')}". Try a clear category such as anime, laptop, book, or ski resort.`,
+        text: `No confident live Lunoo ranking matches "${boundedQuery}". Try a clear category such as anime, laptop, book, or ski resort.`,
       }],
     };
   }
@@ -774,16 +880,16 @@ function slugFromNicheInput(niche) {
  * resolver as find_niche, then fetched only from the selected live JSON URL.
  */
 async function toolGetRankings(niche, limit = 10) {
-  if (!niche || typeof niche !== 'string') {
+  if (typeof niche !== 'string' || !niche.trim() || niche.length > MAX_QUERY_LENGTH) {
     return {
       isError: true,
-      content: [{ type: 'text', text: 'niche parameter is required and must be a string' }],
+      content: [{ type: 'text', text: `niche must be a non-empty string of at most ${MAX_QUERY_LENGTH} characters` }],
     };
   }
 
   limit = Math.min(Math.max(Number.isFinite(Number(limit)) ? Number(limit) : 10, 1), 50);
 
-  const rawNicheInput = String(niche).trim();
+  const rawNicheInput = niche.trim();
   const hasNaturalLanguage = /\s/.test(rawNicheInput);
   // Do not spend a full upstream request probing a hyphenated version of a
   // sentence. Natural-language requests go directly through the resolver;
@@ -870,20 +976,28 @@ async function toolGetRankings(niche, limit = 10) {
  * Extracts JSON-LD blocks from the item page
  */
 async function toolGetItem(slug) {
-  if (!slug || typeof slug !== 'string') {
+  if (typeof slug !== 'string' || !slug.trim() || slug.length > MAX_SLUG_LENGTH) {
     return {
       isError: true,
-      content: [{ type: 'text', text: 'slug parameter is required and must be a string' }],
+      content: [{ type: 'text', text: `slug must be a non-empty string of at most ${MAX_SLUG_LENGTH} characters` }],
     };
   }
 
-  const cacheKey = `item_${slug}`;
+  const boundedSlug = slug.trim().toLowerCase();
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(boundedSlug)) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: 'slug must contain only lowercase letters, numbers, and hyphens' }],
+    };
+  }
+
+  const cacheKey = `item_${boundedSlug}`;
   const cacheTTL = 15 * 60 * 1000; // 15 minutes
 
   let html = getCached(cacheKey, cacheTTL);
 
   if (!html) {
-    const result = await fetchWithTimeout(upstreamUrl(`/item/${encodeURIComponent(slug)}`));
+    const result = await fetchWithTimeout(upstreamUrl(`/item/${encodeURIComponent(boundedSlug)}`));
 
     if (!result.ok) {
       return {
@@ -891,7 +1005,7 @@ async function toolGetItem(slug) {
         content: [
           {
             type: 'text',
-            text: `Item "${slug}" not found (404). Verify the slug and try again.`,
+            text: `Item "${boundedSlug}" not found (404). Verify the slug and try again.`,
           },
         ],
       };
@@ -916,7 +1030,7 @@ async function toolGetItem(slug) {
   }
 
   const output = {
-    url: lunooUrl(`/item/${encodeURIComponent(slug)}`),
+    url: lunooUrl(`/item/${encodeURIComponent(boundedSlug)}`),
     structured_data: structuredData,
   };
 
@@ -955,6 +1069,8 @@ const TOOLS = [
       properties: {
         query: {
           type: 'string',
+          minLength: 1,
+          maxLength: MAX_QUERY_LENGTH,
           description: 'Natural-language ranking request, for example "anime", "coffee makers", or "best laptop for video editing". Use the user\'s request rather than a guessed slug.',
         },
       },
@@ -974,10 +1090,14 @@ const TOOLS = [
       properties: {
         niche: {
           type: 'string',
+          minLength: 1,
+          maxLength: MAX_QUERY_LENGTH,
           description: 'Exact niche slug returned by find_niche, or a natural-language request such as "best laptop for video editing". Examples: "anime" or "japanese-city".',
         },
         limit: {
-          type: 'number',
+          type: 'integer',
+          minimum: 1,
+          maximum: 50,
           description: 'Number of ranked items to return, from 1 to 50. Defaults to 10.',
           default: 10,
         },
@@ -998,6 +1118,9 @@ const TOOLS = [
       properties: {
         slug: {
           type: 'string',
+          minLength: 1,
+          maxLength: MAX_SLUG_LENGTH,
+          pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$',
           description: 'Exact item slug from a Lunoo ranking result or item URL, for example "frieren-beyond-journeys-end".',
         },
       },
@@ -1193,6 +1316,14 @@ app.post('/mcp', async (req, res) => {
   try {
     const body = req.body;
 
+    if (Array.isArray(body) && body.length > MAX_BATCH_SIZE) {
+      return res.status(413).json({
+        jsonrpc: '2.0',
+        error: { code: -32600, message: `Batch size exceeds the ${MAX_BATCH_SIZE}-request limit` },
+        id: null,
+      });
+    }
+
     if (!Array.isArray(body)) {
       // Single request; notifications get 202 with no body
       const response = await handleJsonRpc(body, req);
@@ -1251,10 +1382,19 @@ app.get('/healthz', (req, res) => {
  * Graceful error handling
  */
 app.use((err, req, res, next) => {
-  console.error(err);
+  if (err?.type === 'entity.too.large') {
+    res.status(413).json({ error: 'Request body is too large' });
+    return;
+  }
+
+  if (err instanceof SyntaxError && err?.status === 400) {
+    res.status(400).json({ error: 'Invalid JSON request body' });
+    return;
+  }
+
+  console.error(err?.name || 'Unhandled MCP error');
   res.status(500).json({
     error: 'Internal server error',
-    message: err.message,
   });
 });
 
@@ -1263,10 +1403,10 @@ app.use((err, req, res, next) => {
 // ============================================================
 
 function startServer() {
-  return app.listen(PORT, () => {
-    console.log(`LunooMCP server listening on port ${PORT}`);
-    console.log(`POST http://localhost:${PORT}/mcp - MCP endpoint`);
-    console.log(`GET http://localhost:${PORT}/healthz - Health check`);
+  return app.listen(PORT, HOST, () => {
+    console.log(`LunooMCP server listening on ${HOST}:${PORT}`);
+    console.log(`POST http://${HOST}:${PORT}/mcp - MCP endpoint`);
+    console.log(`GET http://${HOST}:${PORT}/healthz - Health check`);
   });
 }
 
@@ -1284,9 +1424,12 @@ if (shouldStartServer()) {
 
 export {
   app,
+  allowClientRequest,
   buildUsageEvent,
+  cacheEntryCount,
   clearCache,
   countToolResults,
+  HOST,
   handleJsonRpc,
   handleInitialize,
   handleToolCall,

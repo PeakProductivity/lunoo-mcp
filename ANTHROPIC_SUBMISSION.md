@@ -49,3 +49,4 @@ Lunoo stores aggregate connector usage fields such as tool name, success, latenc
 - Natural-language requests, tracked links, unsupported requests, and all three tools have automated regression coverage.
 - The public privacy policy describes connector telemetry, 90-day retention, attribution, and deletion requests.
 - The live server records aggregate usage without raw prompts, arguments, or result text.
+- The Node listener is private to loopback, and request rate, concurrency, body size, batch size, input size, upstream concurrency, and cache size are bounded.
