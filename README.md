@@ -327,7 +327,9 @@ location /mcp {
 
 ## CORS Policy
 
-Live service at https://lunoo.com/mcp allows requests from any origin. Self-hosted instances allow all origins by default (configurable in server.mjs).
+The live service accepts browser requests only from the configured Claude origins. Requests from arbitrary browser origins are rejected. Server-side MCP clients without an `Origin` header are accepted.
+
+Self-hosted instances use the same safe defaults. Override the browser allowlist with the comma-separated `MCP_ALLOWED_ORIGINS` environment variable when necessary.
 
 ## API Endpoints
 
