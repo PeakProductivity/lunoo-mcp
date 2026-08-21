@@ -1,8 +1,8 @@
 # lunoo-mcp
 
-Public Model Context Protocol (MCP) server for Lunoo, a consensus-based rankings platform scoring 74,000+ items across 2,600+ niches on a 0-10 scale.
+Public Model Context Protocol (MCP) server for Lunoo, a rankings platform covering more than 231,000 items across more than 2,600 categories on a 0-10 scale.
 
-Query verified rankings for any topic, from anime and video games to restaurants, SaaS tools, landmarks, and thousands of other categories. Powered by frontier LLM judges and community consensus.
+Ask for rankings in normal language, from anime and laptops to software, travel, books, and thousands of other categories. The server resolves the closest live category, returns scored items with Lunoo links, and refuses unsupported queries instead of inventing a result.
 
 ## Overview
 
@@ -12,25 +12,22 @@ This is a read-only public proxy over Lunoo's public web API. No authentication 
 - **Transport**: Stateless POST over HTTP
 - **Caching**: Browse page 24h, rankings and items 15 minutes
 - **Timeout**: 10 seconds per upstream request
-- **Coverage**: 2,600+ niches, 74,000+ ranked items, updated daily
+- **Coverage**: 2,677+ categories and 231,982+ ranked items, verified on 2026-08-21
+- **Privacy**: No raw prompts, tool arguments, or tool results are stored. See https://lunoo.com/privacy
+- **Safety**: All three tools are read-only and expose MCP read-only annotations
 
 ## Quick Start
 
-### Claude Desktop
+### Claude custom connector
 
-Add to your Claude Desktop config at `%APPDATA%\Claude\claude_desktop_config.json`:
+Open Claude's connector settings, choose **Add custom connector**, and enter:
 
-```json
-{
-  "mcpServers": {
-    "lunoo": {
-      "url": "https://lunoo.com/mcp"
-    }
-  }
-}
+```text
+Name: Lunoo Rankings
+URL: https://lunoo.com/mcp
 ```
 
-Restart Claude Desktop. Lunoo tools will be available in every conversation.
+No authentication is required. Test with a request such as `Find the best laptop for video editing using Lunoo`.
 
 ### Claude Code
 
@@ -85,12 +82,12 @@ curl http://localhost:8972/healthz
 
 ### find_niche
 
-Discover ranking niches by query string. Returns top 10 matches sorted by relevance.
+Resolve a normal-language request to live ranking categories. Returns up to 10 matches with confidence, matched terms, item counts, and tracked Lunoo links.
 
 **Input:**
 ```json
 {
-  "query": "string - search term, e.g. 'anime', 'best restaurants in tokyo'"
+  "query": "string - normal-language request, e.g. 'best laptop for video editing'"
 }
 ```
 
@@ -128,7 +125,7 @@ Discover ranking niches by query string. Returns top 10 matches sorted by releva
 
 ### get_rankings
 
-Fetch the ranked items for a niche. Returns metadata plus top N items with scores, descriptions, and confidence levels.
+Fetch ranked items for a category slug or a normal-language request. Returns the resolved category, match explanation, score metadata, and top items.
 
 **Input:**
 ```json

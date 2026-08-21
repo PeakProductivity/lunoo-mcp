@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.lunoo/rankings",
   "title": "Lunoo Rankings",
-  "description": "Consensus rankings for 75,000+ products across 2,600+ niches.",
+  "description": "Read-only natural-language access to 231,000+ ranked items across 2,600+ categories.",
   "repository": {
     "url": "https://github.com/PeakProductivity/lunoo-mcp",
     "source": "github"

@@ -15,16 +15,16 @@ lunoo-mcp
 
 ### Description (one line)
 ```
-Public MCP server for Lunoo consensus rankings - query 75k+ ranked items across 2,600+ niches from any MCP-capable AI agent
+Read-only natural-language access to more than 231,000 ranked items across more than 2,600 categories
 ```
 
 ### Full Description
 ```
-Lunoo is a consensus-based rankings platform scoring 74,000+ items across 2,600+ niches on a 0-10 scale. This public MCP server provides read-only access to Lunoo rankings via three tools: find_niche (discover ranking categories), get_rankings (fetch top-ranked items for a niche), and get_item (extract structured metadata for an item).
+Lunoo is a rankings platform covering more than 231,000 items across more than 2,600 categories on a 0-10 scale. This public MCP server provides read-only access through three tools: find_niche resolves a normal-language request to live categories, get_rankings returns scored items and match details, and get_item returns public structured metadata for an item.
 
 No authentication required. All requests go through a public HTTP endpoint at https://lunoo.com/mcp with built-in caching and error handling.
 
-Use cases: AI agents that need authoritative rankings data (e.g., "what are the best anime?", "top-rated SaaS tools in 2026"), content generation with verified sourcing, market research automation.
+Use cases include product and entertainment discovery, shortlist creation, comparison research, and finding the closest live Lunoo ranking for a normal-language request.
 ```
 
 ### Transport
@@ -249,7 +249,7 @@ Use this when submitting to registries that accept pasted descriptions:
 ```
 Name: lunoo-mcp
 
-Description: Public MCP server for Lunoo consensus rankings - query 75k+ ranked items across 2,600+ niches from any MCP-capable AI agent
+Description: Read-only natural-language access to more than 231,000 ranked items across more than 2,600 categories
 
 Type: Streamable HTTP
 
